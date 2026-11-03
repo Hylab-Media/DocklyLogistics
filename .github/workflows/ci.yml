@@ -1,9 +1,33 @@
+# CI: Lint, Typecheck, Unit-Tests und Build gegen eine echte Postgres (Job verify).
+# Auf main danach: Image für den Cluster dockly-k8s bauen und ausrollen (Jobs image und rollout).
+#
+# Ausrollen: Nach dem Push schreibt der Job rollout Tag und Digest beider Images ins GitOps-Repo
+# Hylab-Media/k8s-platform (apps/dockly-portal/docklylogistics/values.yaml: App unter image.tag,
+# Migrations-Image unter migration.image). Argo CD führt dann zuerst `prisma migrate deploy` aus
+# (PreSync-Hook) und rollt erst nach dessen Erfolg die App aus. Ein manueller Start auf main rollt den
+# Stand erneut aus (Rückweg).
+#
+# Secrets (k8s-platform/scripts/github-deploy-zugang.sh):
+#   SCW_SECRET_KEY            IAM-Schlüssel, nur Schreibrecht auf die Registry
+#   K8S_PLATFORM_DEPLOY_KEY   Deploy-Key mit Schreibrecht auf Hylab-Media/k8s-platform
+# Laufzeit-Variablen und Secrets liegen im Cluster bzw. im Scaleway Secret Manager (Projekt DocklyPortal),
+# nicht mehr in /opt/logistics/app.env auf der Instanz DocklyLogistics-dev.
 name: CI
 
 on:
   push:
     branches: [main, develop]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Beim Nachschieben eines Commits den alten Lauf abbrechen, aber nur bei Pull Requests:
+# Auf main könnte sonst ein Rollout mittendrin stehen bleiben.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -77,3 +101,172 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+  # Image für den Cluster dockly-k8s (ARM-Nodes, Argo CD), nur nach grünem „verify“ auf main. Gebaut wird
+  # nativ auf ARM. Vorher wurde das Image von Hand auf der Instanz gebaut (cloud-init: docklylogistics:dev).
+  image:
+    name: image
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    outputs:
+      app_digest: ${{ steps.push.outputs.app_digest }}
+      ops_digest: ${{ steps.push.outputs.ops_digest }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: docklylogistics
+          POSTGRES_PASSWORD: docklylogistics
+          POSTGRES_DB: docklylogistics
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docklylogistics"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP: rg.fr-par.scw.cloud/docklylogistics/docklylogistics
+      OPS: rg.fr-par.scw.cloud/docklylogistics/docklylogistics-ops
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Registry-Login
+        env:
+          SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+        run: |
+          [ -n "${SCW_SECRET_KEY}" ] || { echo "::error::Secret SCW_SECRET_KEY fehlt."; exit 1; }
+          printf '%s' "${SCW_SECRET_KEY}" | docker login rg.fr-par.scw.cloud -u nologin --password-stdin
+
+      - name: Buildx-Builder (docker-container, für den Registry-Cache)
+        run: docker buildx create --name docklylogistics --driver docker-container --use --bootstrap
+
+      # Ohne NEXT_PUBLIC_*-Build-Argumente: Sie werden nur auf dem Server gelesen (lib/auth,
+      # lib/warehouse), also zur Laufzeit (k8s-platform apps/dockly-portal/docklylogistics/values.yaml).
+      - name: App-Image bauen (Stufe runner)
+        run: |
+          docker buildx build --pull --target runner \
+            --cache-from "type=registry,ref=${APP}:buildcache" \
+            --cache-to "type=registry,ref=${APP}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            --load --tag docklylogistics:kandidat .
+
+      # prisma migrate deploy läuft im Cluster als Job vor dem Ausrollen; das Runtime-Image enthält die
+      # Prisma-CLI nicht.
+      - name: Migrations-Image bauen (Stufe builder, mit Prisma-CLI)
+        run: |
+          docker buildx build --target builder \
+            --cache-from "type=registry,ref=${APP}:buildcache" \
+            --load --tag docklylogistics-ops:kandidat .
+
+      # Wie im Cluster: Migration gegen eine leere Datenbank (der Job dort bekommt nur den
+      # podSecurityContext), dann die App als Nutzer 1001 mit schreibgeschütztem Dateisystem. Es gibt keinen
+      # Health-Endpunkt: /login muss antworten, ein unbekanntes EDI-Postfach muss nach einer Datenbankabfrage
+      # 401 liefern (500 hieße: Prisma-Engine oder Datenbank kaputt), die Cron-Route ohne Secret ebenfalls 401.
+      - name: Probe der Images
+        run: |
+          set -euo pipefail
+          url='postgresql://docklylogistics:docklylogistics@127.0.0.1:5432/docklylogistics?schema=docklylogistics'
+          docker run --rm --network host -e PGPASSWORD=docklylogistics postgres:16-alpine \
+            psql -h 127.0.0.1 -U docklylogistics -d docklylogistics -qc 'CREATE SCHEMA IF NOT EXISTS docklylogistics;'
+          docker run --rm --network host -e DATABASE_URL="$url" -e CHECKPOINT_DISABLE=1 \
+            docklylogistics-ops:kandidat node_modules/.bin/prisma migrate deploy
+          docker run -d --name probe --network host --user 1001:1001 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --tmpfs /tmp --tmpfs /app/.next/cache:uid=1001,gid=1001 \
+            -e DATABASE_URL="$url" -e NEXTAUTH_SECRET="$(openssl rand -base64 32)" -e NEXTAUTH_URL=http://localhost:3000 \
+            -e NEXT_PUBLIC_APP_URL=http://localhost:3000 -e NEXT_PUBLIC_APP_TENANT=demo \
+            -e KEYCLOAK_URL=http://127.0.0.1:9/auth -e KEYCLOAK_REALM=probe -e KEYCLOAK_CLIENT_ID=probe \
+            -e KEYCLOAK_CLIENT_SECRET=probe -e KEYCLOAK_ISSUER=http://127.0.0.1:9/auth/realms/probe \
+            -e APP_KEY="$(openssl rand -hex 32)" -e CRON_SECRET="$(openssl rand -hex 16)" \
+            docklylogistics:kandidat > /dev/null
+          ende() { docker logs probe 2>&1 | tail -n 40; docker rm -f probe > /dev/null; exit 1; }
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/login -o /dev/null; then
+              edi=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data 'UNA:+.? ' http://127.0.0.1:3000/api/edi/inbound/probe)
+              [ "$edi" = 401 ] || { echo "Unbekanntes EDI-Postfach antwortet ${edi} statt 401"; ende; }
+              cron=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:3000/api/internal/webhooks/dispatch)
+              [ "$cron" = 401 ] || { echo "Cron-Route ohne Secret antwortet ${cron} statt 401"; ende; }
+              echo "App startet, Migration läuft durch, Datenbank antwortet, interne Routen sind gesperrt."
+              docker rm -f probe > /dev/null; exit 0
+            fi
+            sleep 2
+          done
+          ende
+
+      - name: Images pushen
+        id: push
+        run: |
+          set -euo pipefail
+          docker tag docklylogistics:kandidat "${APP}:${GITHUB_SHA}"
+          docker tag docklylogistics-ops:kandidat "${OPS}:${GITHUB_SHA}"
+          docker push --quiet "${APP}:${GITHUB_SHA}"
+          docker push --quiet "${OPS}:${GITHUB_SHA}"
+          digest() { docker inspect --format '{{index .RepoDigests 0}}' "$1" | sed 's/.*@//'; }
+          echo "app_digest=$(digest "${APP}:${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+          echo "ops_digest=$(digest "${OPS}:${GITHUB_SHA}")" >> "$GITHUB_OUTPUT"
+
+      - name: Registry-Logout
+        if: always()
+        run: docker logout rg.fr-par.scw.cloud || true
+
+  # Eigener Job ohne Code aus diesem Repo: Nur er sieht den Schreibschlüssel für das GitOps-Repo.
+  rollout:
+    name: rollout
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: https://logistics.dockly.de
+    concurrency:
+      group: rollout-production
+      cancel-in-progress: false
+    env:
+      SHA: ${{ github.sha }}
+      APP_DIGEST: ${{ needs.image.outputs.app_digest }}
+      OPS_DIGEST: ${{ needs.image.outputs.ops_digest }}
+      OPS_IMAGE: rg.fr-par.scw.cloud/docklylogistics/docklylogistics-ops
+    steps:
+      - name: Checkout GitOps-Repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Hylab-Media/k8s-platform
+          ssh-key: ${{ secrets.K8S_PLATFORM_DEPLOY_KEY }}
+          path: k8s-platform
+
+      # Tag plus Digest: Der Tag zeigt, welcher Commit läuft; der Digest legt das Image fest,
+      # auch wenn jemand den Tag in der Registry später überschreibt.
+      - name: Images im GitOps-Repo setzen
+        working-directory: k8s-platform
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Unerwarteter Commit-Wert: ${SHA}"; exit 1; }
+          for d in "$APP_DIGEST" "$OPS_DIGEST"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Unerwarteter Digest: ${d}"; exit 1; }
+          done
+          datei=apps/dockly-portal/docklylogistics/values.yaml
+          sed -i -E "s|^  tag: .*$|  tag: ${SHA}@${APP_DIGEST}|" "$datei"
+          sed -i -E "s|^  image: ${OPS_IMAGE}:.*$|  image: ${OPS_IMAGE}:${SHA}@${OPS_DIGEST}|" "$datei"
+          for zeile in "  tag: ${SHA}@${APP_DIGEST}" "  image: ${OPS_IMAGE}:${SHA}@${OPS_DIGEST}"; do
+            grep -qxF "$zeile" "$datei" || { echo "Nicht gesetzt in ${datei}: ${zeile}"; exit 1; }
+          done
+          if git diff --quiet; then echo "Images stehen bereits auf ${SHA}"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "DocklyLogistics: Image ${SHA}"
+          for versuch in 1 2 3; do
+            git push -q && exit 0
+            echo "Push abgelehnt, hole den neuesten Stand (${versuch}/3)"; git pull -q --rebase
+          done
+          echo "Tag konnte nicht ins GitOps-Repo geschrieben werden"; exit 1
+
+      # Argo CD gleicht alle 2 Minuten ab; davor läuft `prisma migrate deploy`. Ob die neue Version läuft,
+      # zeigt Argo CD (Application docklylogistics: Synced/Healthy).
+      - name: Smoke-Test nach dem Ausrollen
+        run: |
+          set -euo pipefail
+          sleep 240
+          curl -fsS --retry 6 --retry-delay 10 --retry-all-errors https://logistics.dockly.de/login -o /dev/null
+          echo "Deploy verifiziert: https://logistics.dockly.de/login antwortet."
